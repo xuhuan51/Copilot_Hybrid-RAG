@@ -43,61 +43,74 @@
 ```mermaid
 graph TD
     %% Define Nodes
-    Docs([企业内部技术文档 \n SOP / API / 白皮书 / PDF])
+    Docs([企业内部技术文档<br/>SOP / API / 白皮书 / PDF])
     
-    subgraph ETL[一、 多模态文档解析 ETL]
-        Layout[版面分析 \n Docling / MinerU]
-        VLM[图表语义摘要 \n Qwen-VL]
+    subgraph ETL[1. 多模态文档解析 ETL]
+        Layout[版面分析<br/>Docling / MinerU]
+        VLM[图表语义摘要<br/>Qwen-VL]
         MD[Markdown 高保真转换]
     end
     
-    subgraph Chunking[二、 语义分块增强层]
+    subgraph Chunking[2. 语义分块增强层]
         Split[按标题递归分块]
-        Context[Contextual Retrieval \n 注入 header_path]
+        Context[Contextual Retrieval<br/>注入 header_path]
         QC[Chunk 质量控制]
     end
     
-    subgraph Indexing[三、 知识索引与存储]
-        Embed[BGE-M3 \n Dense + Sparse]
+    subgraph Indexing[3. 知识索引与存储]
+        Embed[BGE-M3<br/>Dense + Sparse]
         DB[(Milvus 向量数据库)]
     end
     
-    subgraph QueryProcess[四、 Query 理解层]
+    subgraph QueryProcess[4. Query 理解层]
         Rewrite[多轮对话改写/压缩]
-        Router[Semantic Router \n 事实/原理/排查]
+        Router[Semantic Router<br/>事实 / 原理 / 排查]
     end
     
-    subgraph Retrieval[五、 Hybrid 混合检索]
-        Dense[Dense Retrieval \n 语义理解]
-        Sparse[Sparse Retrieval \n 术语匹配]
+    subgraph Retrieval[5. Hybrid 混合检索]
+        Dense[Dense Retrieval<br/>语义理解]
+        Sparse[Sparse Retrieval<br/>术语匹配]
         RRF[RRF 融合打分]
     end
     
-    subgraph Rerank[六、 交叉精排层]
-        CrossEnc[Cross-Encoder \n bge-reranker-v2-m3]
+    subgraph Rerank[6. 交叉精排层]
+        CrossEnc[Cross-Encoder<br/>bge-reranker-v2-m3]
     end
     
-    subgraph Generation[七、 答案生成层]
+    subgraph Generation[7. 答案生成层]
         LLM[Qwen2.5 - Ollama]
         Source[引用溯源机制]
     end
     
-    %% Define Edges
-    Docs --> ETL
-    Layout --> VLM --> MD
-    ETL --> Chunking
-    Split --> Context --> QC
-    Chunking --> Indexing
+    %% Edges
+    Docs --> Layout
+    Layout --> VLM
+    VLM --> MD
+    
+    MD --> Split
+    Split --> Context
+    Context --> QC
+    
+    QC --> Embed
     Embed --> DB
     
-    User((用户提问)) --> QueryProcess
-    Rewrite --> Router --> Retrieval
-    DB <.-> Retrieval
+    User((用户提问)) --> Rewrite
+    Rewrite --> Router
+    
+    Router --> Dense
+    Router --> Sparse
+    
+    DB -.-> Dense
+    DB -.-> Sparse
+    
     Dense --> RRF
     Sparse --> RRF
-    Retrieval -->|Top-20 候选| Rerank
-    Rerank -->|Top-5 候选| Generation
-    Generation --> Output([结构化多模态答案])
+    
+    RRF -->|Top-20| CrossEnc
+    CrossEnc -->|Top-5| LLM
+    
+    LLM --> Source
+    Source --> Output([结构化多模态答案])
 ```
 ---
 
