@@ -6,6 +6,10 @@ import os
 import json
 from pathlib import Path
 from tqdm import tqdm
+import os
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 
 from FlagEmbedding import BGEM3FlagModel
 from pymilvus import (
@@ -33,8 +37,8 @@ def create_collection(collection_name: str, dense_dim: int = 1024):
         FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
         FieldSchema(name="chunk_id", dtype=DataType.VARCHAR, max_length=200),
         FieldSchema(name="source_file", dtype=DataType.VARCHAR, max_length=200),
-        FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=500),
-        FieldSchema(name="header_path", dtype=DataType.VARCHAR, max_length=500),
+        FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=2000),
+        FieldSchema(name="header_path", dtype=DataType.VARCHAR, max_length=2000),
         FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=65535),
         FieldSchema(name="dense_vector", dtype=DataType.FLOAT_VECTOR, dim=dense_dim),
         FieldSchema(name="sparse_vector", dtype=DataType.SPARSE_FLOAT_VECTOR),
@@ -125,7 +129,6 @@ def embed_and_insert(
 def build_index(
         chunks_path: str = "data/chunks/all_chunks.json",
         collection_name: str = "hybrid_rag_docs",
-        model_name: str = "BAAI/bge-m3",
         batch_size: int = 32
 ):
     """完整的入库流程"""
@@ -138,8 +141,10 @@ def build_index(
     chunks = load_chunks(chunks_path)
 
     # 3. 加载BGE-M3模型
-    print(f"加载BGE-M3模型: {model_name}")
-    model = BGEM3FlagModel(model_name, use_fp16=True, device="cuda")
+    local_model_path = "/home/liuguangli/.cache/huggingface/hub/models--BAAI--bge-m3/snapshots/5617a9f61b028005a4858fdac845db406aefb181"
+
+    print(f"加载BGE-M3模型(本地): {local_model_path}")
+    model = BGEM3FlagModel(local_model_path, use_fp16=True, device="cuda")
 
     # 快速测试
     test_result = model.encode(["测试"], return_dense=True, return_sparse=True)
