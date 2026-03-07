@@ -14,7 +14,7 @@ import requests
 # ────────────────────── Ollama 调用 ──────────────────────
 
 OLLAMA_BASE_URL = "http://localhost:11434"
-ROUTER_MODEL = "qwen2.5:7b"   # 路由用小模型即可，快速响应
+ROUTER_MODEL = "qwen2.5:14b"   # 路由用小模型即可，快速响应
 
 
 def call_ollama(prompt: str, model: str = ROUTER_MODEL) -> str:
