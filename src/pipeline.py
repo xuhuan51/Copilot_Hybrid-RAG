@@ -105,7 +105,7 @@ class RAGPipeline:
             if verbose:
                 print(f"\n🧠 HyDE 生成假设性回答中...")
             # 让 LLM 生成假答案并拼接，用于扩大 Dense 召回命中率
-            hyde_query = generate_hyde_query(search_query, use_hyde=use_hyde, llm_model=self.llm_model)
+            hyde_query = self.generate_hyde_query(search_query, use_hyde=use_hyde, llm_model=self.llm_model)
             if verbose and hyde_query != search_query:
                 print(f"  [HyDE 增强 Query 长度]: {len(hyde_query)}")
         else:
@@ -157,7 +157,7 @@ class RAGPipeline:
         # ──── 新增 Step 4.5: 动态阈值截断 (Dynamic Cut-off) ────
         before_cutoff_len = len(fine_results)
         # 剔除排名靠后、分数骤降的噪声文档，节省 Token 并降低大模型幻觉
-        fine_results = dynamic_cutoff(fine_results, min_score=0.15, drop_threshold=0.2)
+        fine_results = self.dynamic_cutoff(fine_results, min_score=0.15, drop_threshold=0.2)
 
         if verbose:
             if len(fine_results) < before_cutoff_len:
@@ -202,8 +202,9 @@ class RAGPipeline:
             "answer": result["answer"],
             "sources": result["sources"],
             "confident": result["confident"],
-            "top_rerank_score": result["top_rerank_score"] if result["top_rerank_score"] else 0,  # 防止截断后为空
+            "top_rerank_score": result["top_rerank_score"] if result["top_rerank_score"] else 0,
             "retrieved_docs": fine_results,
+            "retrieved_images": result.get("retrieved_images", []),  # 新增
         }
 
         # ──── 输出结果 ────
@@ -211,6 +212,8 @@ class RAGPipeline:
             self._print_result(output)
 
         return output
+
+
 
     def generate_hyde_query(query: str, use_hyde: bool = True, llm_model: str = "qwen2.5:14b") -> str:
         """
@@ -299,6 +302,17 @@ class RAGPipeline:
         print(f"\n{result['answer']}")
         print(f"\n{'─' * 60}")
         print(result["sources"])
+
+        images = result.get("retrieved_images", [])
+        if images:
+            print(f"\n🖼 命中图片:")
+            for i, img in enumerate(images, 1):
+                print(
+                    f"  [{i}] {img['image_path']} "
+                    f"| {img['source_file']} > {img.get('header_path', '')} "
+                    f"(score={img.get('rerank_score', 0):.2f})"
+                )
+
         print(f"{'═' * 60}")
 
     def reset_memory(self):

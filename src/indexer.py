@@ -40,10 +40,13 @@ def create_collection(collection_name: str, dense_dim: int = 1024):
         FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=2000),
         FieldSchema(name="header_path", dtype=DataType.VARCHAR, max_length=2000),
         FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=65535),
+
+        # 🔴 新增图片路径字段 (可以为空字符串)
+        FieldSchema(name="image_path", dtype=DataType.VARCHAR, max_length=1000),
+
         FieldSchema(name="dense_vector", dtype=DataType.FLOAT_VECTOR, dim=dense_dim),
         FieldSchema(name="sparse_vector", dtype=DataType.SPARSE_FLOAT_VECTOR),
     ]
-
     schema = CollectionSchema(fields=fields, description="Hybrid RAG Document Chunks")
     collection = Collection(name=collection_name, schema=schema)
 
@@ -112,9 +115,13 @@ def embed_and_insert(
         insert_data = [
             [c["chunk_id"] for c in batch],
             [c["source_file"] for c in batch],
-            [c["title"][:500] for c in batch],
+            [c.get("title", "")[:500] for c in batch],
             [c["header_path"][:500] for c in batch],
             [c["content"][:65535] for c in batch],
+
+            # 🔴 提取图片路径，如果没有则为空字符串
+            [c.get("image_path", "")[:1000] for c in batch],
+
             dense_vectors,
             sparse_vectors,
         ]

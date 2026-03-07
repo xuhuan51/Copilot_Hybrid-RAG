@@ -166,8 +166,45 @@ def format_sources(docs: list[dict]) -> str:
     return "\n".join(lines)
 
 
-# ────────────────────── 完整生成流程 ──────────────────────
+def collect_retrieved_images(docs: list[dict], max_images: int = 3) -> list[dict]:
+    """
+    从精排结果中收集命中的图片，按文档顺序去重返回
 
+    返回格式:
+    [
+        {
+            "image_path": "...",
+            "source_file": "...",
+            "title": "...",
+            "header_path": "...",
+            "rerank_score": 0.91,
+        }
+    ]
+    """
+    images = []
+    seen = set()
+
+    for doc in docs:
+        image_path = (doc.get("image_path") or "").strip()
+        if not image_path or image_path in seen:
+            continue
+
+        seen.add(image_path)
+        images.append({
+            "image_path": image_path,
+            "source_file": doc.get("source_file", "未知"),
+            "title": doc.get("title", ""),
+            "header_path": doc.get("header_path", ""),
+            "rerank_score": doc.get("rerank_score", 0),
+        })
+
+        if len(images) >= max_images:
+            break
+
+    return images
+
+
+# ────────────────────── 完整生成流程 ──────────────────────
 def generate_with_sources(
     query: str,
     prompt: str,
@@ -177,38 +214,18 @@ def generate_with_sources(
     confidence_threshold: float = 0.15,
 ) -> dict:
     """
-    完整的答案生成流程，包含置信度判断和引用溯源
-
-    参数:
-        query:    用户问题
-        prompt:   由 router 组装的 prompt
-        docs:     精排后的文档列表
-        intent:   路由意图
-        model:    LLM 模型
-
-    返回:
-        {
-            "answer": str,           # 生成的答案
-            "sources": str,          # 格式化的引用来源
-            "intent": str,           # 识别的意图
-            "confident": bool,       # 是否置信
-            "top_rerank_score": float  # Top-1 精排分数
-        }
+    完整的答案生成流程，包含置信度判断、引用溯源和图片返回
     """
-    # 置信度判断
     confident = check_confidence(docs, threshold=confidence_threshold)
 
     if not confident and docs:
-        # 低置信度: 使用特殊 prompt 提醒 LLM 谨慎回答
         from router import build_context
         context = build_context(docs)
         prompt = LOW_CONFIDENCE_PROMPT.format(context=context, query=query)
 
-    # 生成答案
     answer = generate_answer(prompt=prompt, model=model)
-
-    # 格式化引用来源
     sources = format_sources(docs)
+    retrieved_images = collect_retrieved_images(docs, max_images=3)
 
     return {
         "answer": answer,
@@ -216,8 +233,8 @@ def generate_with_sources(
         "intent": intent,
         "confident": confident,
         "top_rerank_score": docs[0].get("rerank_score", 0) if docs else 0,
+        "retrieved_images": retrieved_images,   # 新增
     }
-
 
 # ────────────────────── 测试入口 ──────────────────────
 

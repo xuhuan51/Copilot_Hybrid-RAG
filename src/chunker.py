@@ -88,7 +88,8 @@ def merge_small_sections(sections: list[dict], min_tokens: int = 100) -> list[di
         token_count = count_tokens(section["content"])
         if token_count < min_tokens and merged:
             # 合并到前一个
-            merged[-1]["content"] += f"\n\n## {section['title']}\n{section['content']}"
+            header = "#" * section["level"]
+            merged[-1]["content"] += f"\n\n{header} {section['title']}\n{section['content']}"
         else:
             merged.append(section)
     return merged
@@ -152,14 +153,17 @@ def chunk_document(
     chunk_id = 0
 
     for section in sections:
-        # 在内容前加上标题路径作为上下文
         header_context = " > ".join(section["header_path"]) if section["header_path"] else ""
         full_content = f"[{header_context}]\n{section['content']}" if header_context else section["content"]
 
         token_count = count_tokens(full_content)
 
+        # 🔴 新增：用正则提取图片路径
+        # 匹配 doc_parser 生成的 ![image](路径)
+        img_match = re.search(r'!\[image\]\((.*?)\)', full_content)
+        image_path = img_match.group(1) if img_match else ""
+
         if token_count <= chunk_size:
-            # 不需要切分
             if token_count >= min_chunk_tokens:
                 chunks.append({
                     "chunk_id": f"{source_file}_chunk_{chunk_id}",
@@ -168,12 +172,17 @@ def chunk_document(
                     "title": section["title"],
                     "content": full_content,
                     "token_count": token_count,
+                    "image_path": image_path,  # 🔴 挂载字段
                 })
                 chunk_id += 1
         else:
-            # 超长section，二次切分
+            # 二次切分逻辑同理，也需要把 image_path 带上
             sub_chunks = split_long_section(full_content, chunk_size, chunk_overlap)
             for j, sub_content in enumerate(sub_chunks):
+                # 检查切分后的子段落是否包含图片
+                sub_img_match = re.search(r'!\[image\]\((.*?)\)', sub_content)
+                sub_image_path = sub_img_match.group(1) if sub_img_match else ""
+
                 tc = count_tokens(sub_content)
                 if tc >= min_chunk_tokens:
                     chunks.append({
@@ -183,9 +192,9 @@ def chunk_document(
                         "title": f"{section['title']} (part {j + 1})",
                         "content": sub_content,
                         "token_count": tc,
+                        "image_path": sub_image_path,  # 🔴 挂载字段
                     })
                     chunk_id += 1
-
     return chunks
 
 
@@ -247,4 +256,9 @@ def chunk_all_documents(parsed_dir: str, output_dir: str, chunk_size: int = 768,
 
 if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    chunk_all_documents("data/parsed_docs", "data/chunks", chunk_size=768, chunk_overlap=150)
+    chunk_all_documents(
+        "data/parsed_docs",
+        "data/chunks",
+        chunk_size=512,
+        chunk_overlap=100
+    )

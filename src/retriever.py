@@ -132,7 +132,14 @@ def dense_search(
         anns_field="dense_vector",
         param={"metric_type": "IP", "params": {"nprobe": 16}},
         limit=top_k,
-        output_fields=["chunk_id", "source_file", "title", "header_path", "content"],
+        output_fields=[
+            "chunk_id",
+            "source_file",
+            "title",
+            "header_path",
+            "content",
+            "image_path",   # 新增
+        ],
     )
 
     hits = []
@@ -143,6 +150,42 @@ def dense_search(
             "title": hit.entity.get("title"),
             "header_path": hit.entity.get("header_path"),
             "content": hit.entity.get("content"),
+            "image_path": hit.entity.get("image_path") or "",   # 新增
+            "score": hit.score,
+        })
+    return hits
+
+
+def sparse_search(
+    collection: Collection,
+    sparse_vec: dict,
+    top_k: int = 20,
+) -> list[dict]:
+    """Sparse向量检索（术语精确匹配）"""
+    results = collection.search(
+        data=[sparse_vec],
+        anns_field="sparse_vector",
+        param={"metric_type": "IP"},
+        limit=top_k,
+        output_fields=[
+            "chunk_id",
+            "source_file",
+            "title",
+            "header_path",
+            "content",
+            "image_path",   # 新增
+        ],
+    )
+
+    hits = []
+    for hit in results[0]:
+        hits.append({
+            "chunk_id": hit.entity.get("chunk_id"),
+            "source_file": hit.entity.get("source_file"),
+            "title": hit.entity.get("title"),
+            "header_path": hit.entity.get("header_path"),
+            "content": hit.entity.get("content"),
+            "image_path": hit.entity.get("image_path") or "",   # 新增
             "score": hit.score,
         })
     return hits

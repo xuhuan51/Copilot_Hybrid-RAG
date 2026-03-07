@@ -1,88 +1,135 @@
-"""
-文档解析器 - 使用 Docling 将 PDF 转换为 Markdown
-"""
 import os
-import json
+import base64
+import requests
+from io import BytesIO
+from PIL import Image
 from pathlib import Path
-from datetime import datetime
 from tqdm import tqdm
+from docling_core.types.doc import TextItem, TableItem, PictureItem
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.datamodel.document import InputFormat
 
-try:
-    from docling.document_converter import DocumentConverter, PdfFormatOption
-    from docling.datamodel.pipeline_options import PdfPipelineOptions
-    from docling.datamodel.accelerator_options import AcceleratorOptions
-    from docling.datamodel.base_models import InputFormat
-except ImportError:
-    print("请先安装 docling: pip install docling")
-    exit(1)
+# ────────────────────── 配置区 ──────────────────────
 
+from pathlib import Path
 
-def parse_documents(input_dir: str, output_dir: str) -> list[dict]:
-    input_path = Path(input_dir)
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+# 项目根目录
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-    supported = {".pdf", ".docx", ".doc"}
-    files = [f for f in input_path.iterdir() if f.suffix.lower() in supported]
+# 关键目录
+DATA_DIR = PROJECT_ROOT / "data"
+RAW_DOCS_DIR = DATA_DIR / "raw_docs"
+IMAGE_SAVE_DIR = DATA_DIR / "images"
+OUTPUT_MD_DIR = DATA_DIR / "parsed_docs"
 
-    if not files:
-        print(f"在 {input_dir} 下没有找到PDF/Word文档")
-        return []
+# 创建目录
+RAW_DOCS_DIR.mkdir(parents=True, exist_ok=True)
+IMAGE_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_MD_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"找到 {len(files)} 个文档，开始解析...")
+OLLAMA_BASE_URL = "http://localhost:11434"
+VL_MODEL = "qwen2.5vl:32b"
 
-    # 使用GPU加速版面分析
-    accelerator = AcceleratorOptions(device="cuda")
-    pipeline_options = PdfPipelineOptions(accelerator_options=accelerator)
+# ────────────────────── 视觉模型处理 ──────────────────────
 
-    # 修改这里的 FormatOption 为 PdfFormatOption
+def process_vision_element(image: Image.Image, element_id: str) -> str:
+    """
+    保存原图并调用 Qwen-VL 生成摘要
+    返回: 直接返回拼装好的 Markdown 格式文本（含图片路径和摘要）
+    """
+    image_path = IMAGE_SAVE_DIR / f"vision_{element_id}.png"
+    image.save(image_path, format="PNG")
+
+    buffered = BytesIO()
+    image.save(buffered, format="PNG")
+    img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+    vl_prompt = """你是一个资深的架构专家。请详细解析这张系统架构图。
+要求：识别组件、描述数据流向和调用关系，直接输出技术解析内容。"""
+
+    try:
+        resp = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={
+                "model": VL_MODEL,
+                "prompt": vl_prompt,
+                "stream": False,
+                "images": [img_base64],
+                "options": {"temperature": 0.1, "num_predict": 300}
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        summary = resp.json()["response"].strip()
+
+        # 🟢 返回符合协议的 Markdown 片段
+        return f"\n\n![image]({image_path})\n> **[图表语义摘要]**\n> {summary}\n\n"
+
+    except Exception as e:
+        print(f"  [VL Error] 视觉解析失败: {e}")
+        return f"\n\n![image]({image_path})\n> **[图表解析失败，仅保留原图]**\n\n"
+
+# ────────────────────── 文档解析主流程 ──────────────────────
+
+def parse_pdf_multimodal(pdf_path: str):
+    """解析 PDF 并生成完整的 Markdown 文件"""
+    print(f"\n🚀 开始解析文档: {pdf_path}")
+
+    # 🔴 修复：初始化完整内容变量
+    full_markdown_content = ""
+    source_name = os.path.basename(pdf_path)
+
+    # 配置 Docling
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.generate_picture_images = True
     converter = DocumentConverter(
-        format_options={
-            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-        }
+        allowed_formats=[InputFormat.PDF],
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
     )
-    results = []
 
-    for file in tqdm(files, desc="解析文档"):
-        try:
-            print(f"\n  -> 正在解析: {file.name}")
-            result = converter.convert(str(file))
-            markdown_content = result.document.export_to_markdown()
+    try:
+        doc = converter.convert(pdf_path).document
+        items = list(doc.iterate_items())
 
-            md_filename = file.stem + ".md"
-            md_path = output_path / md_filename
-            md_path.write_text(markdown_content, encoding="utf-8")
+        for item, level in tqdm(items, desc=f"解析 {source_name}"):
+            # 1. 处理标题
+            if isinstance(item, TextItem) and item.label.name in ["title", "section_header"]:
+                prefix = "#" * (level + 1)
+                full_markdown_content += f"\n\n{prefix} {item.text}\n"
+                continue
 
-            doc_meta = {
-                "source_file": file.name,
-                "markdown_path": str(md_path),
-                "file_size_kb": round(file.stat().st_size / 1024, 1),
-                "markdown_length": len(markdown_content),
-                "parsed_at": datetime.now().isoformat(),
-            }
-            results.append(doc_meta)
-            print(f"  完成: {md_filename} ({len(markdown_content)} chars)")
+            # 2. 处理文本和表格
+            if isinstance(item, (TextItem, TableItem)):
+                text = item.text if isinstance(item, TextItem) else item.export_to_markdown()
+                full_markdown_content += text + "\n"
 
-        except Exception as e:
-            print(f"  解析失败 {file.name}: {e}")
-            results.append({
-                "source_file": file.name,
-                "error": str(e),
-            })
+            # 3. 处理图片
+            elif isinstance(item, PictureItem):
+                img = item.get_image(doc)
+                if img and img.width > 150 and img.height > 150:
+                    img_id = f"{source_name}_p{item.prov[0].page_no}_{id(item)}"
+                    # 获取视觉解析后的 Markdown 片段
+                    full_markdown_content += process_vision_element(img, element_id=img_id)
 
-    report_path = output_path / "_parse_report.json"
-    with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+        # 🔴 修复：保存为独立 Markdown 文件
+        output_file = OUTPUT_MD_DIR / f"{source_name}.md"
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(full_markdown_content)
 
-    success = [r for r in results if "error" not in r]
-    failed = [r for r in results if "error" in r]
-    print(f"\n{'='*50}")
-    print(f"解析完成: {len(success)} 成功, {len(failed)} 失败")
-    print(f"Markdown输出目录: {output_path}")
+        print(f"✅ 解析完成: {output_file}")
 
-    return results
+    except Exception as e:
+        print(f"❌ 解析文档 {source_name} 时出错: {e}")
 
+# ────────────────────── 批量运行入口 ──────────────────────
 
 if __name__ == "__main__":
-    os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    parse_documents("data/raw_docs", "data/parsed_docs")
+    pdf_files = list(RAW_DOCS_DIR.glob("*.pdf"))
+
+    if not pdf_files:
+        print(f"请将 PDF 文件放入: {RAW_DOCS_DIR}")
+    else:
+        print(f"共发现 {len(pdf_files)} 个文档，开始执行多模态解析...")
+        for pdf in pdf_files:
+            parse_pdf_multimodal(str(pdf))

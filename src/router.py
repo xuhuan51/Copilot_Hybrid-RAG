@@ -219,27 +219,29 @@ def get_prompt(query: str, context: str, intent: str = None, use_llm: bool = Tru
 
 
 # ────────────────────── 上下文拼接 ──────────────────────
-
 def build_context(docs: list[dict], max_length: int = 4000) -> str:
     """
     将精排后的文档列表拼接为 LLM 可用的上下文文本
 
-    每个文档包含: 来源、章节路径、内容
+    每个文档包含: 来源、章节路径、图片信息、内容
     添加序号方便 LLM 引用溯源
     """
     context_parts = []
     current_length = 0
 
     for i, doc in enumerate(docs):
+        image_path = doc.get("image_path", "").strip()
+        image_info = f"图片: {image_path}\n" if image_path else "图片: 无\n"
+
         part = (
             f"[资料{i+1}]\n"
-            f"来源: {doc['source_file']}\n"
+            f"来源: {doc.get('source_file', '')}\n"
             f"章节: {doc.get('header_path', '')}\n"
-            f"内容: {doc['content']}\n"
+            f"{image_info}"
+            f"内容: {doc.get('content', '')}\n"
         )
 
         if current_length + len(part) > max_length:
-            # 截断最后一条，尽量保留完整的前几条
             remaining = max_length - current_length
             if remaining > 100:
                 part = part[:remaining] + "\n...(截断)"
