@@ -316,3 +316,31 @@ if __name__ == "__main__":
     # 5. 断开连接
     connections.disconnect("default")
     print("\n测试完成!")
+
+    # ---- 诊断 Sparse 检索 ----
+    query = "Kafka consumer max.poll.records"
+    result = model.encode([query], return_dense=True, return_sparse=True)
+
+    sparse_vec = result["lexical_weights"][0]
+    if isinstance(sparse_vec, dict):
+        print(f"Sparse向量非零项数量: {len(sparse_vec)}")
+        print(f"Sparse向量样例(前10): {dict(list(sparse_vec.items())[:10])}")
+    else:
+        print(f"Sparse向量类型异常: {type(sparse_vec)}")
+
+    # 直接用sparse搜一下，看原始返回
+    from pymilvus import Collection
+
+    collection = Collection("hybrid_rag_docs")
+    collection.load()
+
+    raw_results = collection.search(
+        data=[sparse_vec],
+        anns_field="sparse_vector",
+        param={"metric_type": "IP"},
+        limit=5,
+        output_fields=["chunk_id", "title"],
+    )
+    print(f"\nSparse原始返回条数: {len(raw_results[0])}")
+    for hit in raw_results[0]:
+        print(f"  score={hit.score:.4f}  title={hit.entity.get('title')}")
