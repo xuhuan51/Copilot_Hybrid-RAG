@@ -215,7 +215,7 @@ class RAGPipeline:
 
 
 
-    def generate_hyde_query(query: str, use_hyde: bool = True, llm_model: str = "qwen2.5:14b") -> str:
+    def generate_hyde_query(self, query: str, use_hyde: bool = True, llm_model: str = "qwen2.5:14b") -> str:
         """
         HyDE (Hypothetical Document Embeddings) 召回前置增强
         让 LLM 先生成一个假设性答案，再拼接回原 query 用于 Dense 检索。
@@ -253,7 +253,7 @@ class RAGPipeline:
             print(f"  [HyDE] 生成失败: {e}，回退到原始 query")
             return query
 
-    def dynamic_cutoff(scored_docs: list[dict], min_score: float = 0.15, drop_threshold: float = 0.2) -> list[dict]:
+    def dynamic_cutoff(self, scored_docs: list[dict], min_score: float = 0.15, drop_threshold: float = 0.2) -> list[dict]:
         """
         动态阈值截断机制
 

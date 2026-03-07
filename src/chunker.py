@@ -98,18 +98,60 @@ def merge_small_sections(sections: list[dict], min_tokens: int = 100) -> list[di
 def split_long_section(text: str, max_tokens: int, overlap_tokens: int) -> list[str]:
     """
     对超长section按段落边界切分
-    尽量在段落（空行）处切分，而不是硬截断
+    增加降级策略：优先按空行(\n\n)切分，过长的段落降级按单换行(\n)切分，极端情况按字符硬截断。
     """
+    # 1. 尝试按双换行符（段落）切分
     paragraphs = re.split(r'\n\s*\n', text)
 
     chunks = []
     current_chunk = ""
+
+    # 辅助函数：处理超级大段落的降级切分
+    def process_huge_paragraph(huge_para: str):
+        # 降级1：按单换行符切分
+        lines = huge_para.split('\n')
+        temp_chunk = ""
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # 如果单行文本依然是个巨无霸（极端情况）
+            if count_tokens(line) > max_tokens:
+                if temp_chunk:
+                    chunks.append(temp_chunk.strip())
+                    temp_chunk = ""
+                # 降级2：按字符硬截断 (由于您的估算是 1 token ≈ 3 字符，所以按最大字符数截断)
+                max_chars = max(1, max_tokens * 3)
+                for i in range(0, len(line), max_chars):
+                    chunks.append(line[i:i + max_chars])
+            else:
+                test_temp = temp_chunk + "\n" + line if temp_chunk else line
+                if count_tokens(test_temp) > max_tokens and temp_chunk:
+                    chunks.append(temp_chunk.strip())
+                    temp_chunk = line  # 开启新chunk
+                else:
+                    temp_chunk = test_temp
+
+        if temp_chunk.strip():
+            chunks.append(temp_chunk.strip())
 
     for para in paragraphs:
         para = para.strip()
         if not para:
             continue
 
+        # 🔴 核心修复点：如果单个段落本身就超过了最大限制，交由降级策略处理
+        if count_tokens(para) > max_tokens:
+            # 先把已积累的正常文本存进去
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+            # 处理超大段落
+            process_huge_paragraph(para)
+            continue
+
+        # 正常合并逻辑
         test_chunk = current_chunk + "\n\n" + para if current_chunk else para
 
         if count_tokens(test_chunk) > max_tokens and current_chunk:

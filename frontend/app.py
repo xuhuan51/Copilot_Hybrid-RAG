@@ -4,6 +4,7 @@
 """
 import sys
 import os
+import time
 
 # 将 src 目录加入 path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -18,9 +19,7 @@ from reranker import rerank
 from retriever import hybrid_retrieve
 from router import classify_intent, build_context, get_prompt
 
-
 import streamlit as st
-import time
 
 
 # ────────────────────── 页面配置 ──────────────────────
@@ -143,10 +142,16 @@ def render_sidebar():
         st.markdown("---")
         st.markdown("## 🔧 功能开关")
 
-        use_memory = st.checkbox("多轮对话改写", value=True,
-                                  help="开启后支持追问，自动补全上下文")
-        use_router = st.checkbox("语义路由", value=True,
-                                  help="根据问题意图自动选择 Prompt 模板")
+        use_memory = st.checkbox(
+            "多轮对话改写",
+            value=True,
+            help="开启后支持追问，自动补全上下文"
+        )
+        use_router = st.checkbox(
+            "语义路由",
+            value=True,
+            help="根据问题意图自动选择 Prompt 模板"
+        )
 
         st.markdown("---")
 
@@ -184,6 +189,31 @@ def render_intent_tag(intent: str) -> str:
     return f'<span class="intent-tag {cls}">{label}</span>'
 
 
+def collect_retrieved_images(docs: list[dict], max_images: int = 3) -> list[dict]:
+    """从精排结果中收集命中的图片并去重"""
+    images = []
+    seen = set()
+
+    for doc in docs:
+        image_path = (doc.get("image_path") or "").strip()
+        if not image_path or image_path in seen:
+            continue
+
+        seen.add(image_path)
+        images.append({
+            "image_path": image_path,
+            "source_file": doc.get("source_file", "未知"),
+            "title": doc.get("title", ""),
+            "header_path": doc.get("header_path", ""),
+            "rerank_score": doc.get("rerank_score", 0),
+        })
+
+        if len(images) >= max_images:
+            break
+
+    return images
+
+
 def render_sources(docs: list[dict]):
     """渲染引用来源"""
     if not docs:
@@ -195,8 +225,9 @@ def render_sources(docs: list[dict]):
             source = doc.get("source_file", "未知")
             title = doc.get("title", "")
             header = doc.get("header_path", "")
+            display_title = header if header else title
+            has_image = " [含图]" if doc.get("image_path") else ""
 
-            # 颜色根据分数变化
             if score >= 0.8:
                 color = "#16a34a"
             elif score >= 0.5:
@@ -207,14 +238,40 @@ def render_sources(docs: list[dict]):
             st.markdown(
                 f'<div class="source-card">'
                 f'<span class="score" style="color:{color}">相关度 {score:.2f}</span> | '
-                f'**{source}** > {title}'
+                f'**{source}** > {display_title}{has_image}'
                 f'</div>',
                 unsafe_allow_html=True,
             )
 
-            # 可展开查看原文
             with st.expander(f"查看资料 [{i+1}] 原文", expanded=False):
-                st.text(doc.get("content", "")[:500])
+                st.text(doc.get("content", "")[:1000])
+
+
+def render_images(images: list[dict]):
+    """渲染命中的相关图片"""
+    if not images:
+        return
+
+    with st.expander("🖼 相关图片", expanded=False):
+        for i, img in enumerate(images, 1):
+            image_path = img.get("image_path", "").strip()
+            if not image_path:
+                continue
+
+            st.markdown(
+                f"**[{i}] {img.get('source_file', '未知')}**  \n"
+                f"章节：{img.get('header_path', '')}  \n"
+                f"相关度：{img.get('rerank_score', 0):.2f}"
+            )
+
+            if os.path.exists(image_path):
+                st.image(
+                    image_path,
+                    caption=f"{img.get('source_file', '')} | {img.get('title', '')}",
+                    use_container_width=True,
+                )
+            else:
+                st.warning(f"图片文件不存在: {image_path}")
 
 
 def render_search_stats(result: dict):
@@ -222,10 +279,6 @@ def render_search_stats(result: dict):
     rewritten = result.get("rewritten_query", "")
     original = result.get("query", "")
     intent = result.get("intent", "")
-
-    cols = []
-    if rewritten != original:
-        cols.append(f"🔄 改写: *{rewritten}*")
 
     intent_html = render_intent_tag(intent)
 
@@ -244,7 +297,6 @@ def render_search_stats(result: dict):
 # ────────────────────── 主界面 ──────────────────────
 
 def main():
-    # 头部
     st.markdown(
         '<div class="main-header">'
         '<h1>🚀 研发效能 Copilot</h1>'
@@ -253,13 +305,9 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # 侧边栏
     settings = render_sidebar()
-
-    # 获取 Pipeline
     pipeline = get_pipeline()
 
-    # 初始化对话历史
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
@@ -268,27 +316,23 @@ def main():
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-            # 如果是 assistant 消息且有额外信息
             if msg["role"] == "assistant" and "result" in msg:
                 render_search_stats(msg["result"])
                 render_sources(msg["result"].get("retrieved_docs", []))
+                render_images(msg["result"].get("retrieved_images", []))
 
     # 用户输入
     if user_input := st.chat_input("输入你的技术问题..."):
-        # 显示用户消息
         with st.chat_message("user"):
             st.markdown(user_input)
         st.session_state.messages.append({"role": "user", "content": user_input})
 
-        # 生成回答
         with st.chat_message("assistant"):
-            # ── Step 1: 检索 + 精排 ──
             status = st.status("🔍 混合检索 + 精排中...", expanded=True)
             start_time = time.time()
 
             with status:
-                # Query 改写
-
+                # Step 1: Query 改写
                 if settings["use_memory"]:
                     search_query = rewrite_query(user_input, pipeline.memory, use_llm=True)
                 else:
@@ -297,23 +341,24 @@ def main():
                 if search_query != user_input:
                     st.write(f"🔄 Query 改写: {search_query}")
 
-                # 意图分类
+                # Step 2: 意图分类
                 if settings["use_router"]:
                     intent = classify_intent(search_query, use_llm=True)
                 else:
                     intent = "factual"
                 st.write(f"🎯 意图: {intent}")
 
-                # 混合检索
+                # Step 3: 混合检索
                 st.write("🔍 Dense + Sparse 双路检索...")
                 coarse_results = hybrid_retrieve(
                     query=search_query,
                     model=pipeline.embed_model,
                     collection=pipeline.collection,
+                    intent=intent,  # 关键：把意图传进去
                     final_top_k=settings["retrieve_top_k"],
                 )
 
-                # 精排
+                # Step 4: 精排
                 st.write("⚡ Cross-Encoder 精排...")
                 fine_results = rerank(
                     query=search_query,
@@ -322,26 +367,29 @@ def main():
                     top_k=settings["rerank_top_k"],
                 )
 
+                # Step 5: 收集命中图片
+                retrieved_images = collect_retrieved_images(fine_results, max_images=3)
+
                 retrieve_time = time.time() - start_time
                 st.write(f"✅ 检索完成 ({retrieve_time:.1f}s)")
 
             status.update(label=f"检索完成 ({retrieve_time:.1f}s)", state="complete", expanded=False)
 
-            # ── Step 2: 置信度判断 ──
+            # Step 6: 置信度判断
             confident = check_confidence(fine_results)
             top_score = fine_results[0].get("rerank_score", 0) if fine_results else 0
 
             if not confident:
                 st.warning("⚠️ 知识库中未找到高度相关内容，以下回答仅供参考")
 
-            # ── Step 3: 组装 Prompt ──
+            # Step 7: 组装 Prompt
             context = build_context(fine_results)
             if not confident and fine_results:
                 prompt = LOW_CONFIDENCE_PROMPT.format(context=context, query=search_query)
             else:
                 prompt, intent = get_prompt(query=search_query, context=context, intent=intent)
 
-            # ── Step 4: 流式生成答案 ──
+            # Step 8: 流式生成答案
             answer_placeholder = st.empty()
             full_answer = ""
 
@@ -351,12 +399,12 @@ def main():
 
             answer_placeholder.markdown(full_answer)
 
-            # ── Step 5: 更新对话历史 ──
+            # Step 9: 更新对话历史
             if settings["use_memory"]:
                 pipeline.memory.add_user_message(user_input)
                 pipeline.memory.add_assistant_message(full_answer)
 
-            # 构造结果用于显示统计和来源
+            # 构造结果
             result = {
                 "query": user_input,
                 "rewritten_query": search_query,
@@ -365,13 +413,14 @@ def main():
                 "confident": confident,
                 "top_rerank_score": top_score,
                 "retrieved_docs": fine_results,
+                "retrieved_images": retrieved_images,
             }
 
-            # 显示检索统计和来源
+            # 当前轮显示
             render_search_stats(result)
             render_sources(result.get("retrieved_docs", []))
+            render_images(result.get("retrieved_images", []))
 
-        # 保存到历史
         st.session_state.messages.append({
             "role": "assistant",
             "content": full_answer,

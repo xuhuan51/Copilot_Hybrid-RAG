@@ -83,6 +83,7 @@ def parse_pdf_multimodal(pdf_path: str):
     # 配置 Docling
     pipeline_options = PdfPipelineOptions()
     pipeline_options.generate_picture_images = True
+    pipeline_options.images_scale = 3.0  # 🔴 新增：将图片提取分辨率放大 3 倍 (约216 DPI)
     converter = DocumentConverter(
         allowed_formats=[InputFormat.PDF],
         format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
@@ -92,6 +93,7 @@ def parse_pdf_multimodal(pdf_path: str):
         doc = converter.convert(pdf_path).document
         items = list(doc.iterate_items())
 
+        image_counter = 0
         for item, level in tqdm(items, desc=f"解析 {source_name}"):
             # 1. 处理标题
             if isinstance(item, TextItem) and item.label.name in ["title", "section_header"]:
@@ -108,7 +110,8 @@ def parse_pdf_multimodal(pdf_path: str):
             elif isinstance(item, PictureItem):
                 img = item.get_image(doc)
                 if img and img.width > 150 and img.height > 150:
-                    img_id = f"{source_name}_p{item.prov[0].page_no}_{id(item)}"
+                    image_counter += 1  # 🔴 新增：每次遇到图片加 1
+                    img_id = f"{source_name}_p{item.prov[0].page_no}_{image_counter}"  # 🔴 修改：使用固定的序号
                     # 获取视觉解析后的 Markdown 片段
                     full_markdown_content += process_vision_element(img, element_id=img_id)
 
