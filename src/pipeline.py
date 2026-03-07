@@ -5,6 +5,10 @@ RAG 全链路 Pipeline
 一个函数走完从"用户提问"到"生成带引用答案"的完整流程
 """
 import os
+import inspect
+
+import requests
+
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
@@ -68,37 +72,20 @@ class RAGPipeline:
         print(f"{'=' * 60}\n")
 
     def query(
-        self,
-        user_query: str,
-        retrieve_top_k: int = 20,
-        rerank_top_k: int = 5,
-        use_memory: bool = True,
-        use_router: bool = True,
-        verbose: bool = True,
+            self,
+            user_query: str,
+            retrieve_top_k: int = 20,
+            rerank_top_k: int = 5,
+            use_memory: bool = True,
+            use_router: bool = True,
+            use_hyde: bool = True,  # <--- HyDE 开关
+            verbose: bool = True,
     ) -> dict:
         """
-        完整的 RAG 问答流程
-
-        参数:
-            user_query:     用户问题
-            retrieve_top_k: 混合检索召回数量
-            rerank_top_k:   精排后保留数量
-            use_memory:     是否启用多轮对话改写
-            use_router:     是否启用语义路由
-            verbose:        是否打印中间过程
-
-        返回:
-            {
-                "query":           原始用户问题,
-                "rewritten_query": 改写后的检索 query,
-                "intent":          识别的意图类型,
-                "answer":          生成的答案,
-                "sources":         引用溯源信息,
-                "confident":       是否置信,
-                "top_rerank_score": Top-1 精排分数,
-                "retrieved_docs":  精排后的文档列表,
-            }
+        完整的 RAG 问答流程 (已集成 HyDE 与动态阈值截断)
         """
+        import inspect  # 确保 inspect 已导入
+
         if verbose:
             print(f"\n{'─' * 60}")
             print(f"📝 用户提问: {user_query}")
@@ -113,7 +100,19 @@ class RAGPipeline:
         if verbose and search_query != user_query:
             print(f"\n🔄 Query 改写: {search_query}")
 
+        # ──── 新增 Step 1.5: HyDE 拓展 ────
+        if use_hyde:
+            if verbose:
+                print(f"\n🧠 HyDE 生成假设性回答中...")
+            # 让 LLM 生成假答案并拼接，用于扩大 Dense 召回命中率
+            hyde_query = generate_hyde_query(search_query, use_hyde=use_hyde, llm_model=self.llm_model)
+            if verbose and hyde_query != search_query:
+                print(f"  [HyDE 增强 Query 长度]: {len(hyde_query)}")
+        else:
+            hyde_query = search_query
+
         # ──── Step 2: 意图分类 ────
+        # ⚠️ 注意：意图分类必须用原始的 search_query，防止被 HyDE 的幻觉内容干扰
         if use_router:
             intent = classify_intent(search_query, use_llm=True)
         else:
@@ -131,28 +130,44 @@ class RAGPipeline:
         if verbose:
             print(f"\n🔍 混合检索中...")
 
-        coarse_results = hybrid_retrieve(
-            query=search_query,
-            model=self.embed_model,
-            collection=self.collection,
-            final_top_k=retrieve_top_k,
-        )
+        retrieve_kwargs = {
+            "query": hyde_query,  # ⚠️ 这里传入增强后的 hyde_query 用于混合检索
+            "model": self.embed_model,
+            "collection": self.collection,
+            "final_top_k": retrieve_top_k,
+        }
+        # 新版 retriever 已支持 intent-aware retrieval；旧版无该参数时保持兼容
+        if "intent" in inspect.signature(hybrid_retrieve).parameters:
+            retrieve_kwargs["intent"] = intent
+
+        coarse_results = hybrid_retrieve(**retrieve_kwargs)
 
         # ──── Step 4: Cross-Encoder 精排 ────
         if verbose:
             print(f"\n⚡ Cross-Encoder 精排中...")
 
+        effective_rerank_top_k = max(rerank_top_k, 8) if intent == "troubleshoot" else rerank_top_k
         fine_results = rerank(
-            query=search_query,
+            query=search_query,  # ⚠️ 精排时必须用真实的 search_query 算分，抛弃 HyDE 内容
             candidates=coarse_results,
             reranker=self.reranker_model,
-            top_k=rerank_top_k,
+            top_k=effective_rerank_top_k,
         )
 
+        # ──── 新增 Step 4.5: 动态阈值截断 (Dynamic Cut-off) ────
+        before_cutoff_len = len(fine_results)
+        # 剔除排名靠后、分数骤降的噪声文档，节省 Token 并降低大模型幻觉
+        fine_results = dynamic_cutoff(fine_results, min_score=0.15, drop_threshold=0.2)
+
         if verbose:
-            print(f"  精排 Top-{len(fine_results)} 结果:")
+            if len(fine_results) < before_cutoff_len:
+                print(f"  ✂️ 动态截断生效: 保留了 {len(fine_results)}/{before_cutoff_len} 篇高优文档")
+            else:
+                print(f"  ✅ 动态截断: 未触发，保留全部 {len(fine_results)} 篇文档")
+
+            print(f"  最终精排 Top-{len(fine_results)} 结果:")
             for i, doc in enumerate(fine_results):
-                print(f"    [{i+1}] score={doc['rerank_score']:.4f} | {doc['source_file']} > {doc['title']}")
+                print(f"    [{i + 1}] score={doc['rerank_score']:.4f} | {doc['source_file']} > {doc['title']}")
 
         # ──── Step 5: 组装 Prompt ────
         context = build_context(fine_results)
@@ -187,7 +202,7 @@ class RAGPipeline:
             "answer": result["answer"],
             "sources": result["sources"],
             "confident": result["confident"],
-            "top_rerank_score": result["top_rerank_score"],
+            "top_rerank_score": result["top_rerank_score"] if result["top_rerank_score"] else 0,  # 防止截断后为空
             "retrieved_docs": fine_results,
         }
 
@@ -196,6 +211,82 @@ class RAGPipeline:
             self._print_result(output)
 
         return output
+
+    def generate_hyde_query(query: str, use_hyde: bool = True, llm_model: str = "qwen2.5:14b") -> str:
+        """
+        HyDE (Hypothetical Document Embeddings) 召回前置增强
+        让 LLM 先生成一个假设性答案，再拼接回原 query 用于 Dense 检索。
+        """
+        if not use_hyde:
+            return query
+
+        hyde_prompt = f"""你是一个资深的企业级技术专家。请根据以下问题，提供一段简短的、假设性的标准答案。
+    注意：不需要保证回答完全正确，只需尽可能包含该问题涉及的核心技术术语、配置参数或原理解释即可。保持简短。
+
+    用户问题: {query}
+    假设性答案:"""
+
+        try:
+            resp = requests.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": llm_model,
+                    "prompt": hyde_prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.3,  # 稍微给点温度，允许发散出相关的技术词
+                        "num_predict": 150,  # 限制长度，不需要长篇大论
+                    },
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            hypothetical_answer = resp.json()["response"].strip()
+
+            # 将原问题和假设性答案拼接。这能极大丰富 Dense 向量的语义特征。
+            enhanced_query = f"{query}\n{hypothetical_answer}"
+            return enhanced_query
+        except Exception as e:
+            print(f"  [HyDE] 生成失败: {e}，回退到原始 query")
+            return query
+
+    def dynamic_cutoff(scored_docs: list[dict], min_score: float = 0.15, drop_threshold: float = 0.2) -> list[dict]:
+        """
+        动态阈值截断机制
+
+        参数:
+            scored_docs: 经过 Reranker 打分并降序排列的文档列表
+            min_score: 绝对分数底线。低于此分数的文档直接丢弃。
+            drop_threshold: 相对分数落差阈值。如果两篇相邻文档分差大于此值，丢弃后面的所有文档。
+        """
+        if not scored_docs:
+            return []
+
+        filtered_docs = [scored_docs[0]]  # 排名第一的肯定要保留（除非它也低于 min_score，后面统一兜底）
+
+        for i in range(1, len(scored_docs)):
+            prev_score = scored_docs[i - 1].get("rerank_score", 0)
+            curr_score = scored_docs[i].get("rerank_score", 0)
+
+            # 条件1：断崖式下跌截断
+            if (prev_score - curr_score) >= drop_threshold:
+                print(
+                    f"  [Cut-off] 触发断崖截断: Doc {i} (score {prev_score:.3f}) -> Doc {i + 1} (score {curr_score:.3f})")
+                break
+
+            # 条件2：绝对低分截断
+            if curr_score < min_score:
+                print(f"  [Cut-off] 触发低分截断: Doc {i + 1} 分数 {curr_score:.3f} 低于阈值 {min_score}")
+                break
+
+            filtered_docs.append(scored_docs[i])
+
+        # 兜底：如果第一篇的分数也低得离谱，说明这道题知识库里根本没有
+        if filtered_docs and filtered_docs[0].get("rerank_score", 0) < min_score:
+            print("  [Cut-off] Top-1 文档分数过低，清空所有召回结果以防幻觉。")
+            return []
+
+        return filtered_docs
 
     def _print_result(self, result: dict):
         """格式化输出结果"""

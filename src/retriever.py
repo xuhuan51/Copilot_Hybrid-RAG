@@ -6,6 +6,7 @@ import os
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
+import re
 from FlagEmbedding import BGEM3FlagModel
 from pymilvus import connections, Collection
 
@@ -23,24 +24,97 @@ def load_embed_model(
     return model
 
 
+# ────────────────────── 术语抽取 ──────────────────────
+
+def extract_terms(query: str) -> str | None:
+    """
+    从 query 中抽取高价值英文术语，用于 Sparse 检索
+
+    只保留两类高价值术语:
+    1. 带点号的参数名: max.poll.records, session.timeout.ms, batch.size
+    2. 大写缩写/专有词: ISR, RDB, AOF, SASL, SSL
+
+    泛词 (kafka, redis, consumer, topic, broker 等) 不走 Sparse，
+    因为它们对精确匹配没有帮助，反而会引入主题相关但答案不准的噪声。
+    """
+    broad_terms = {
+        "kafka", "redis", "mysql", "consumer", "producer", "broker",
+        "topic", "cluster", "partition", "message", "server", "client",
+        "config", "configuration", "data", "node", "group", "key",
+        "value", "type", "set", "list", "hash", "string", "log",
+        "file", "memory", "disk", "network", "security", "monitor",
+        "backup", "restore", "master", "slave", "replica",
+    }
+
+    stopwords = {
+        "a", "an", "the", "is", "are", "was", "were", "be", "been",
+        "being", "have", "has", "had", "do", "does", "did", "will",
+        "would", "could", "should", "may", "might", "can", "shall",
+        "to", "of", "in", "for", "on", "with", "at", "by", "from",
+        "as", "into", "about", "between", "through", "and", "or",
+        "but", "not", "no", "if", "then", "than", "so", "it", "its",
+        "this", "that", "these", "those", "what", "which", "who",
+        "how", "when", "where", "why",
+    }
+
+    terms = []
+
+    # 1. 带点号的参数名 (最高价值)
+    param_names = re.findall(r'[a-zA-Z][a-zA-Z0-9]*(?:\.[a-zA-Z][a-zA-Z0-9]*)+', query)
+    terms.extend(param_names)
+
+    # 2. 大写缩写词 (2-6个大写字母，如 ISR, RDB, AOF, SASL)
+    abbreviations = re.findall(r'\b[A-Z]{2,6}\b', query)
+    terms.extend(abbreviations)
+
+    # 3. 其他英文词，但过滤停用词和泛词
+    other_words = re.findall(r'[a-zA-Z]{2,}', query)
+    for word in other_words:
+        w_lower = word.lower()
+        if w_lower not in stopwords and w_lower not in broad_terms and word not in terms:
+            terms.append(word)
+
+    if terms:
+        return " ".join(terms)
+    return None
+
+
 # ────────────────────── 查询向量化 ──────────────────────
 
 def encode_query(model: BGEM3FlagModel, query: str) -> dict:
     """
     将用户query编码为Dense + Sparse向量
+
+    关键设计:
+    - Dense: 用完整 query 编码（保留语义）
+    - Sparse: 只用抽取出的英文术语编码（避免中文噪声）
+    - 无英文术语时: Sparse 返回空字典，完全由 Dense 主导
+
     返回: {"dense": list[float], "sparse": dict}
     """
-    result = model.encode(
+    dense_result = model.encode(
         [query],
         return_dense=True,
-        return_sparse=True,
+        return_sparse=False,
         return_colbert_vecs=False,
     )
+    dense_vec = dense_result["dense_vecs"][0].tolist()
 
-    dense_vec = result["dense_vecs"][0].tolist()
-    sparse_vec = result["lexical_weights"][0]
-    if not isinstance(sparse_vec, dict):
-        sparse_vec = dict(sparse_vec)
+    sparse_query = extract_terms(query)
+    if sparse_query:
+        sparse_result = model.encode(
+            [sparse_query],
+            return_dense=False,
+            return_sparse=True,
+            return_colbert_vecs=False,
+        )
+        sparse_vec = sparse_result["lexical_weights"][0]
+        if not isinstance(sparse_vec, dict):
+            sparse_vec = dict(sparse_vec)
+        print(f"  Sparse query: '{sparse_query}'")
+    else:
+        sparse_vec = {}
+        print("  Sparse query: (无高价值术语，跳过 Sparse)")
 
     return {"dense": dense_vec, "sparse": sparse_vec}
 
@@ -110,23 +184,14 @@ def reciprocal_rank_fusion(
     top_k: int = 20,
     dense_weight: float = 1.0,
     sparse_weight: float = 1.0,
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
     """
     Reciprocal Rank Fusion (RRF) 融合双路检索结果
 
     score(d) = Σ weight_i / (k + rank_i(d))
-
-    参数:
-        dense_hits:   Dense检索结果
-        sparse_hits:  Sparse检索结果
-        k:            RRF超参数，默认60（鲁棒性好，无需调参）
-        top_k:        最终返回的文档数
-        dense_weight:  Dense路权重
-        sparse_weight: Sparse路权重
     """
-    score_map = {}   # chunk_id -> {"score", "doc", "dense_rank", "sparse_rank"}
+    score_map = {}
 
-    # Dense路打分
     for rank, hit in enumerate(dense_hits):
         cid = hit["chunk_id"]
         rrf_score = dense_weight / (k + rank + 1)
@@ -138,9 +203,8 @@ def reciprocal_rank_fusion(
                 "sparse_rank": None,
             }
         score_map[cid]["score"] += rrf_score
-        score_map[cid]["dense_rank"] = rank + 1  # 1-indexed
+        score_map[cid]["dense_rank"] = rank + 1
 
-    # Sparse路打分
     for rank, hit in enumerate(sparse_hits):
         cid = hit["chunk_id"]
         rrf_score = sparse_weight / (k + rank + 1)
@@ -154,18 +218,16 @@ def reciprocal_rank_fusion(
         score_map[cid]["score"] += rrf_score
         score_map[cid]["sparse_rank"] = rank + 1
 
-    # 按RRF分数降序排列
     fused = sorted(score_map.values(), key=lambda x: x["score"], reverse=True)
 
     results = []
     for item in fused[:top_k]:
         doc = item["doc"].copy()
         doc["rrf_score"] = item["score"]
-        doc["dense_rank"] = item["dense_rank"]    # None = 该路未命中
+        doc["dense_rank"] = item["dense_rank"]
         doc["sparse_rank"] = item["sparse_rank"]
         results.append(doc)
 
-    # 融合统计（用于调试和消融实验）
     dense_ids = {h["chunk_id"] for h in dense_hits}
     sparse_ids = {h["chunk_id"] for h in sparse_hits}
     overlap = dense_ids & sparse_ids
@@ -179,69 +241,106 @@ def reciprocal_rank_fusion(
     return results, stats
 
 
+def _dense_only_as_rrf(dense_hits: list[dict], top_k: int, rrf_k: int) -> list[dict]:
+    """把纯 Dense 结果补齐成统一字段格式，便于后续 rerank/分析。"""
+    results = []
+    for i, hit in enumerate(dense_hits[:top_k]):
+        doc = hit.copy()
+        doc["rrf_score"] = 1.0 / (rrf_k + i + 1)
+        doc["dense_rank"] = i + 1
+        doc["sparse_rank"] = None
+        results.append(doc)
+    return results
+
+
 # ────────────────────── 完整检索流程 ──────────────────────
 
 def hybrid_retrieve(
     query: str,
     model: BGEM3FlagModel,
     collection: Collection,
+    intent: str | None = None,
     dense_top_k: int = 20,
-    sparse_top_k: int = 20,
+    sparse_top_k: int = 5,
     final_top_k: int = 20,
     rrf_k: int = 60,
     dense_weight: float = 1.0,
-    sparse_weight: float = 1.0,
+    sparse_weight: float = 0.2,
+    conceptual_dense_top_k: int = 25,
+    troubleshoot_dense_top_k: int = 30,
+    troubleshoot_sparse_top_k: int = 12,
+    troubleshoot_sparse_weight: float = 0.15,
 ) -> list[dict]:
     """
-    完整的混合检索流程:
-    1. Query向量化 (Dense + Sparse)
-    2. 双路检索
-    3. RRF融合
-    4. 返回Top-K结果
+    意图感知的混合检索流程
 
-    参数:
-        query:         用户查询
-        model:         BGE-M3模型
-        collection:    Milvus Collection
-        dense_top_k:   Dense路召回数量
-        sparse_top_k:  Sparse路召回数量
-        final_top_k:   最终返回数量（送入Reranker）
-        rrf_k:         RRF超参数
-        dense_weight:  Dense路权重
-        sparse_weight: Sparse路权重
+    策略分流:
+    - conceptual:   纯 Dense，更大候选池，交给 reranker 挑最优
+    - factual:      Dense + Sparse (有高价值术语时)
+    - troubleshoot: Dense / Sparse 都扩池，再交给 reranker 做更强筛选
     """
-    # 1. Query向量化
     query_vecs = encode_query(model, query)
 
-    # 2. 双路检索
-    dense_hits = dense_search(collection, query_vecs["dense"], top_k=dense_top_k)
-    sparse_hits = sparse_search(collection, query_vecs["sparse"], top_k=sparse_top_k)
+    _dense_top_k = dense_top_k
+    _sparse_top_k = sparse_top_k
+    _final_top_k = final_top_k
+    _dense_weight = dense_weight
+    _sparse_weight = sparse_weight
+    _use_sparse = bool(query_vecs["sparse"])
 
+    if intent == "conceptual":
+        _dense_top_k = max(dense_top_k, conceptual_dense_top_k)
+        _final_top_k = max(final_top_k, conceptual_dense_top_k)
+        _use_sparse = False
+        print("  策略: conceptual → 纯Dense + 扩大候选池")
+    elif intent == "troubleshoot":
+        _dense_top_k = max(dense_top_k, troubleshoot_dense_top_k)
+        _sparse_top_k = max(sparse_top_k, troubleshoot_sparse_top_k)
+        _final_top_k = max(final_top_k, troubleshoot_dense_top_k)
+        _sparse_weight = troubleshoot_sparse_weight
+        print(
+            "  策略: troubleshoot → Dense 扩池"
+            + (f" + Sparse 扩池(top_k={_sparse_top_k})" if _use_sparse else "")
+        )
+    else:
+        print("  策略: factual → Dense" + (" + Sparse" if _use_sparse else ""))
+
+    dense_hits = dense_search(collection, query_vecs["dense"], top_k=_dense_top_k)
     print(f"  Dense召回: {len(dense_hits)} 条")
-    print(f"  Sparse召回: {len(sparse_hits)} 条")
 
-    # 3. RRF融合
-    fused_results, stats = reciprocal_rank_fusion(
-        dense_hits=dense_hits,
-        sparse_hits=sparse_hits,
-        k=rrf_k,
-        top_k=final_top_k,
-        dense_weight=dense_weight,
-        sparse_weight=sparse_weight,
+    if _use_sparse:
+        sparse_hits = sparse_search(collection, query_vecs["sparse"], top_k=_sparse_top_k)
+        print(f"  Sparse召回: {len(sparse_hits)} 条")
+    else:
+        sparse_hits = []
+        if intent != "conceptual":
+            print("  Sparse召回: 跳过 (无高价值术语)")
+
+    if sparse_hits:
+        fused_results, stats = reciprocal_rank_fusion(
+            dense_hits=dense_hits,
+            sparse_hits=sparse_hits,
+            k=rrf_k,
+            top_k=_final_top_k,
+            dense_weight=_dense_weight,
+            sparse_weight=_sparse_weight,
+        )
+        print(f"  RRF融合后: {len(fused_results)} 条")
+        print(f"  ├─ Dense独占: {stats['dense_only']} 条")
+        print(f"  ├─ Sparse独占: {stats['sparse_only']} 条")
+        print(f"  ├─ 双路重叠: {stats['overlap']} 条")
+        print(f"  └─ 去重总计: {stats['total_unique']} 条")
+    else:
+        fused_results = _dense_only_as_rrf(dense_hits, top_k=_final_top_k, rrf_k=rrf_k)
+        print(f"  纯Dense模式: {len(fused_results)} 条")
+
+    top_both = sum(1 for d in fused_results if d.get("dense_rank") and d.get("sparse_rank"))
+    top_dense_only = sum(1 for d in fused_results if d.get("dense_rank") and not d.get("sparse_rank"))
+    top_sparse_only = sum(1 for d in fused_results if not d.get("dense_rank") and d.get("sparse_rank"))
+    print(
+        f"  Top-{len(fused_results)} 贡献: "
+        f"双路命中={top_both}, Dense独占={top_dense_only}, Sparse独占={top_sparse_only}"
     )
-
-    # 调试统计
-    print(f"  RRF融合后: {len(fused_results)} 条")
-    print(f"  ├─ Dense独占: {stats['dense_only']} 条")
-    print(f"  ├─ Sparse独占: {stats['sparse_only']} 条")
-    print(f"  ├─ 双路重叠: {stats['overlap']} 条")
-    print(f"  └─ 去重总计: {stats['total_unique']} 条")
-
-    # Top-K中双路贡献分析
-    top_both = sum(1 for d in fused_results if d["dense_rank"] and d["sparse_rank"])
-    top_dense_only = sum(1 for d in fused_results if d["dense_rank"] and not d["sparse_rank"])
-    top_sparse_only = sum(1 for d in fused_results if not d["dense_rank"] and d["sparse_rank"])
-    print(f"  Top-{len(fused_results)} 贡献: 双路命中={top_both}, Dense独占={top_dense_only}, Sparse独占={top_sparse_only}")
 
     return fused_results
 
@@ -255,7 +354,6 @@ def print_results(results: list[dict], show_content: bool = False):
     print(f"{'='*60}")
 
     for i, doc in enumerate(results):
-        # 判断来源标签
         dr = doc.get("dense_rank")
         sr = doc.get("sparse_rank")
         if dr and sr:
@@ -279,68 +377,37 @@ def print_results(results: list[dict], show_content: bool = False):
 # ────────────────────── 测试入口 ──────────────────────
 
 if __name__ == "__main__":
-    # 1. 连接Milvus
     print("连接Milvus...")
     connections.connect(host="localhost", port="19530")
 
-    # 2. 加载Collection
     collection_name = "hybrid_rag_docs"
     collection = Collection(collection_name)
     collection.load()
     print(f"Collection {collection_name} 已加载，共 {collection.num_entities} 条记录")
 
-    # 3. 加载BGE-M3
     model = load_embed_model()
 
-    # 4. 测试检索
     test_queries = [
-        "Kafka consumer max.poll.records 参数配置",
-        "如何排查服务超时问题",
-        "API接口鉴权机制",
+        ("Kafka consumer max.poll.records 参数配置", "factual"),
+        ("Kafka consumer group 的 rebalance 机制是怎么工作的", "conceptual"),
+        ("Kafka consumer 报 session timeout 异常怎么排查", "troubleshoot"),
     ]
 
-    for query in test_queries:
+    for query, intent in test_queries:
         print(f"\n{'#'*60}")
         print(f"Query: {query}")
+        print(f"Intent: {intent}")
         print(f"{'#'*60}")
 
         results = hybrid_retrieve(
             query=query,
             model=model,
             collection=collection,
-            final_top_k=5,
+            intent=intent,
+            final_top_k=20,
         )
 
         print_results(results, show_content=True)
 
-    # 5. 断开连接
     connections.disconnect("default")
     print("\n测试完成!")
-
-    # ---- 诊断 Sparse 检索 ----
-    query = "Kafka consumer max.poll.records"
-    result = model.encode([query], return_dense=True, return_sparse=True)
-
-    sparse_vec = result["lexical_weights"][0]
-    if isinstance(sparse_vec, dict):
-        print(f"Sparse向量非零项数量: {len(sparse_vec)}")
-        print(f"Sparse向量样例(前10): {dict(list(sparse_vec.items())[:10])}")
-    else:
-        print(f"Sparse向量类型异常: {type(sparse_vec)}")
-
-    # 直接用sparse搜一下，看原始返回
-    from pymilvus import Collection
-
-    collection = Collection("hybrid_rag_docs")
-    collection.load()
-
-    raw_results = collection.search(
-        data=[sparse_vec],
-        anns_field="sparse_vector",
-        param={"metric_type": "IP"},
-        limit=5,
-        output_fields=["chunk_id", "title"],
-    )
-    print(f"\nSparse原始返回条数: {len(raw_results[0])}")
-    for hit in raw_results[0]:
-        print(f"  score={hit.score:.4f}  title={hit.entity.get('title')}")
