@@ -5,10 +5,10 @@
 ![Milvus](https://img.shields.io/badge/Milvus-Vector%20DB-blue)
 ![Qwen](https://img.shields.io/badge/LLM-Qwen2.5-green)
 
-
-
 > 一个面向企业技术文档的 **多模态 Hybrid RAG 知识问答系统**。  
-> 深度支持 **版面解析、多模态知识抽取、混合检索、精排、语义路由与多轮对话**，彻底解决复杂排版和专业术语带来的检索失真问题。
+> 深度支持 **版面解析、多模态知识抽取、意图感知混合检索、精排、动态阈值截断与多轮对话**，彻底解决复杂排版和专业术语带来的检索失真问题。
+
+![Demo](assets/demo.gif)
 
 ---
 
@@ -17,8 +17,8 @@
 - [项目背景与痛点](#-项目背景与痛点)
 - [系统整体架构](#-系统整体架构)
 - [核心技术创新](#-核心技术创新)
-- [技术栈选型](#-技术栈选型)
 - [评测与指标](#-评测与指标)
+- [技术栈选型](#-技术栈选型)
 - [项目结构](#-项目结构)
 - [未来优化方向](#-未来优化方向)
 
@@ -28,7 +28,7 @@
 
 企业内部存在大量高价值的技术文档（如：SOP 操作手册、API 文档、技术白皮书、架构设计文档、故障排查手册）。在传统的 RAG 架构下，这些文档的处理往往面临以下三大痛点：
 
-1. **文档解析失真**：普通 PDF 解析仅提取纯文本，导致表格结构丢失、标题层级混乱、图表信息完全缺失。
+1. **文档解析失真**：普通 PDF 解析仅提取纯文本，导致表格结构丢失、标题层级混乱，系统架构图、流程图等视觉信息完全缺失。
 2. **单路检索不稳定**：纯向量（Dense）检索擅长语义泛化，但对专有名词、API 参数等 Exact Match（精确匹配）场景能力极弱。
 3. **生成阶段“幻觉”**：召回阶段如果上下文不准或缺失层级关联，LLM 极易产生答非所问的幻觉。
 
@@ -52,9 +52,8 @@ graph TD
     end
     
     subgraph Chunking[2. 语义分块增强层]
-        Split[按标题递归分块]
-        Context[Contextual Retrieval<br/>注入 header_path]
-        QC[Chunk 质量控制]
+        Split[按标题递归分块 + 降级切分]
+        Context[Contextual Retrieval<br/>注入 header_path & 图片路径]
     end
     
     subgraph Indexing[3. 知识索引与存储]
@@ -64,22 +63,24 @@ graph TD
     
     subgraph QueryProcess[4. Query 理解层]
         Rewrite[多轮对话改写/压缩]
-        Router[Semantic Router<br/>事实 / 原理 / 排查]
+        HyDE[HyDE 假设性回答增强]
+        Router[Semantic Router<br/>规则 + LLM 意图分类]
     end
     
-    subgraph Retrieval[5. Hybrid 混合检索]
+    subgraph Retrieval[5. 意图感知混合检索]
         Dense[Dense Retrieval<br/>语义理解]
-        Sparse[Sparse Retrieval<br/>术语匹配]
+        Sparse[Sparse Retrieval<br/>高价值术语匹配]
         RRF[RRF 融合打分]
     end
     
     subgraph Rerank[6. 交叉精排层]
         CrossEnc[Cross-Encoder<br/>bge-reranker-v2-m3]
+        Cutoff[Dynamic Cut-off<br/>动态阈值截断]
     end
     
     subgraph Generation[7. 答案生成层]
         LLM[Qwen2.5 - Ollama]
-        Source[引用溯源机制]
+        Source[引用溯源与多模态图片挂载]
     end
     
     %% Edges
@@ -89,14 +90,14 @@ graph TD
     
     MD --> Split
     Split --> Context
-    Context --> QC
-    
-    QC --> Embed
+    Context --> Embed
     Embed --> DB
     
     User((用户提问)) --> Rewrite
+    Rewrite --> HyDE
     Rewrite --> Router
     
+    HyDE --> Dense
     Router --> Dense
     Router --> Sparse
     
@@ -106,23 +107,25 @@ graph TD
     Dense --> RRF
     Sparse --> RRF
     
-    RRF -->|Top-20| CrossEnc
-    CrossEnc -->|Top-5| LLM
+    RRF -->|Top-k 候选| CrossEnc
+    CrossEnc --> Cutoff
+    Cutoff -->|精选上下文| LLM
     
     LLM --> Source
     Source --> Output([结构化多模态答案])
 ```
+
 ---
 
 ## 💡 核心技术创新
 
 ### 1. Layout-aware 多模态文档解析
-摒弃传统纯文本提取，接入 **Docling** 与 **MinerU** 进行深度版面分析：
+摒弃传统纯文本提取，接入 **Docling** 进行深度版面分析：
 * 准确识别并保留**标题层级**与**表格结构**。
-* 结合 **Qwen-VL** 对架构图、流程图生成高维语义描述，实现“看图检索”。
+* 结合 **Qwen-VL** 视觉大模型对架构图、流程图生成高维语义描述，实现“看图检索”，并将图片路径与摘要融合入 Markdown。
 
-### 2. Contextual Retrieval (上下文增强分块)
-切分 Chunk 时自动注入完整的标题路径（Header Path），解决局部文本指代不明的问题：
+### 2. Contextual Retrieval 上下文增强分块
+切分 Chunk 时自动注入完整的标题路径（Header Path）与图片引用，解决局部文本指代不明的问题，并提供段落过长时的智能降级切分策略：
 ```text
 # ❌ 普通分块：无法得知参数归属
 该参数默认值为 500
@@ -132,25 +135,40 @@ graph TD
 该参数默认值为 500
 ```
 
-### 3. Dense + Sparse 混合检索与 RRF 融合
-针对企业文档中密集的专有名词，采用双路检索：
-* **Dense**：负责语义泛化理解。
-* **Sparse**：负责 API、错误码等精确术语匹配。
-* **模型**：`BAAI/bge-m3`。
+### 3. Query 理解与 HyDE 增强
+* **多轮 Query 改写**：识别代词与省略主语，将依赖上下文的追问改写为独立的检索 Query。
+* **HyDE 增强**：让 LLM 生成假设性答案并拼接至原问题，极大丰富 Dense 向量的语义特征，提升召回率。
+* **Semantic Router (95.2% 准确率)**：基于规则+LLM双路分类，将问题路由为 **事实查询 (Factual)**、**原理解释 (Conceptual)** 或 **故障排查 (Troubleshoot)**，并动态调整后续检索策略和 Prompt。
 
-采用 **Reciprocal Rank Fusion (RRF)** 算法消除双路分数尺度差异，公式如下：
+### 4. 意图感知的混合检索与 RRF 融合
+动态调整双路检索策略：
+* **Factual**：Dense + Sparse（针对 `max.poll.records` 等带点号参数名或大写专有名词进行高价值术语抽取）。
+* **Conceptual**：纯 Dense，扩大候选池，交给 Reranker 挑最优。
+* **Troubleshoot**：Dense 和 Sparse 均扩大召回池。
+采用 **Reciprocal Rank Fusion (RRF)** 算法消除双路分数尺度差异。
 
-score(d) = Σ ( 1 / (k + rank_i(d)) )
+### 5. Cross-Encoder 精排与动态截断
+* 使用 `bge-reranker-v2-m3` 计算 Query-Doc 的细粒度交互相关性分数。
+* **Dynamic Cut-off (动态阈值截断)**：通过绝对分数底线（如 0.15）和断崖式下跌落差（如 0.2）双重校验，剔除噪声文档，节省 Token 并大幅降低大模型幻觉。
 
-*(注：系统默认设置 k = 60，无需繁琐调参即可获得鲁棒效果)*
+---
 
-### 4. Cross-Encoder 细粒度精排
-针对双塔 Embedding 无法建模 Query-Doc 细粒度交互的问题，引入 `bge-reranker-v2-m3`：
-* 流程：`Top-20 粗排候选 -> Cross Encoder -> Top-5 精确上下文`。
+## 📊 评测与指标
 
-### 5. Semantic Router 与引用溯源
-* **智能路由**：根据问题意图（事实查询 / 原理解释 / 故障排查）自动切换 Prompt 模板。
-* **溯源机制**：生成答案时强制附带“文档来源、章节路径、图表出处”，保障企业级应用的可信度。
+项目构建了专属的 QA 评测数据集，基于真实代码与数据集的消融实验结果如下：
+
+### 检索性能评估 (Hit Rate & MRR)
+引入混合检索与精排后，系统的各项检索核心指标均获得断崖式提升：
+
+| 实验阶段 | 核心策略 | Hit Rate@1 | Hit Rate@3 | MRR |
+| :--- | :--- | :--- | :--- | :--- |
+| **Baseline** | 仅 Dense 单路向量检索 | 52.38% | 85.71% | 0.6508 |
+| **+ Hybrid** | Dense + Sparse (RRF 融合) | 57.14% | 90.48% | 0.7063 |
+| **🌟 完整系统** | Hybrid + Cross-Encoder Rerank | **71.43%** | **95.24%** | **0.8254** |
+
+### 语义路由评估
+Semantic Router 模块在区分 `Factual` (事实查询), `Conceptual` (原理解释), `Troubleshoot` (故障排查) 三种企业常见查询意图上表现优异：
+* **整体路由准确率 (Accuracy)**: **95.24%** (测试集仅 1 例错判)
 
 ---
 
@@ -158,27 +176,12 @@ score(d) = Σ ( 1 / (k + rank_i(d)) )
 
 | 模块 | 核心技术选型 | 说明 |
 | :--- | :--- | :--- |
-| **文档解析** | Docling / MinerU | 高精度版面还原与结构化提取 |
-| **VLM (视觉大模型)** | Qwen-VL | 图表语义理解与摘要生成 |
+| **文档解析** | Docling | 高精度版面还原与结构化提取 |
+| **VLM (视觉大模型)** | Qwen-VL (32B) | 图表语义理解与摘要生成 |
 | **Embedding** | BGE-M3 | 支持多语言，同时输出 Dense 与 Sparse 向量 |
 | **向量数据库** | Milvus | 支持混合索引存储的高性能向量库 |
 | **Reranker** | bge-reranker-v2-m3 | Cross-Encoder 架构，提升 Top-K 准确率 |
-| **LLM** | Qwen2.5 (Ollama) | 强大的开源推理与指令遵循能力 |
-| **前端交互** | Streamlit | 快速构建轻量级数据交互可视化界面 |
-| **部署环境** | Docker Compose | 容器化一键部署环境 |
-
----
-
-## 📊 评测与指标
-
-项目构建了专属的 QA 评测数据集，并进行了严格的消融实验：
-
-| 实验方法 | 描述 | Hit Rate@5 | Hit Rate@3 | MRR |
-| :--- | :--- | :--- | :--- | :--- |
-| **Baseline** | 仅 Dense 向量检索 | - | - | - |
-| **+ Hybrid** | Dense + Sparse 双路 | 显著提升 | 提升 | 提升 |
-| **+ Rerank** | Hybrid + Cross Encoder | 大幅提升 | 大幅提升 | 大幅提升 |
-| **🌟 完整系统** | Hybrid + Rerank + Router | **最优** | **最优** | **最优** |
+| **LLM / 路由** | Qwen2.5 (14B) | 强大的开源推理、指令遵循与 Query 分析能力 |
 
 ---
 
@@ -191,22 +194,23 @@ Copilot_hybrid_RAG/
 ├── data/
 │   ├── raw_docs/               # 原始企业文档 (PDF/Word)
 │   ├── parsed_docs/            # 解析后的 Markdown/结构化数据
+│   ├── images/                 # 多模态解析提取的图片资源
 │   └── chunks/                 # 序列化后的分块数据
 ├── src/
 │   ├── doc_parser.py           # 多模态解析器 (Docling + Qwen-VL)
-│   ├── chunker.py              # 语义增强分块器
-│   ├── indexer.py              # 向量库索引构建
-│   ├── retriever.py            # 混合检索模块 (Dense + Sparse + RRF)
+│   ├── chunker.py              # 语义增强分块器 (Header Path + 降级切分)
+│   ├── indexer.py              # 向量库构建 (Milvus Dense+Sparse 索引)
+│   ├── retriever.py            # 混合检索模块 (高价值术语抽取 + 意图感知)
 │   ├── reranker.py             # Cross-Encoder 精排模块
-│   ├── router.py               # 语义路由器
-│   ├── memory.py               # 多轮对话上下文管理
-│   ├── generator.py            # LLM 答案生成与溯源
-│   └── pipeline.py             # RAG 全链路串联
+│   ├── router.py               # 语义路由器 (规则+LLM双引擎)
+│   ├── memory.py               # 多轮对话上下文管理与改写
+│   ├── generator.py            # LLM 答案生成与多模态引用溯源
+│   └── pipeline.py             # RAG 全链路串联 (含 HyDE 与 Dynamic Cut-off)
 ├── frontend/
-│   └── app.py                  # Streamlit 问答交互端
+│   └── app.py                  # Streamlit 交互前端 (规划中)
 ├── evaluation/
 │   ├── eval_dataset.json       # 评测数据集
-│   └── evaluate.py             # 评测指标计算脚本
+│   └── evaluate.py             # 评测脚本
 └── docker-compose.yaml         # Milvus & 服务一键部署
 ```
 
